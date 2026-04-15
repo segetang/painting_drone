@@ -1,0 +1,36 @@
+# 모델 파일 (용량 커서 Git 제외)
+models/*.pt
+models/*.pth
+models/*.onnx
+
+# ROS2 빌드 결과물
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+*.so
+
+# 데이터셋
+datasets/
+data/
+
+# 학습 결과물
+training_history_*.json
+checkpoint_*.pth
+best_model_*.pth
+best_miou_*.pth
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
