@@ -31,16 +31,18 @@ Publish:
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
+import json
 import numpy as np
 import cv2
 from dataclasses import dataclass
-from typing import List
+from typing import List, Dict
 
 from sensor_msgs.msg import Image
 from vision_msgs.msg import Detection2DArray, Detection2D, ObjectHypothesisWithPose
 from geometry_msgs.msg import Point
+from std_msgs.msg import String
 from cv_bridge import CvBridge
 
 
@@ -65,6 +67,15 @@ BBOX_COLORS = {
 # 이미지 크기 (카메라 해상도)
 IMAGE_W = 640
 IMAGE_H = 480
+
+# exclusion_zones 발행 주기 (초)
+EXCLUSION_PUB_INTERVAL = 1.0
+# 오탐 필터: 최근 N프레임 중 M회 이상 감지 시 확정
+EXCLUSION_CONFIRM_FRAMES = 5
+EXCLUSION_CONFIRM_COUNT  = 3
+
+# 도색 불가 클래스 (exclusion_zones 대상)
+OBSTACLE_CLASSES = {'window', 'balcony', 'blind'}
 
 
 @dataclass
@@ -121,11 +132,22 @@ class BBoxDetectionNode(Node):
         self.bridge       = CvBridge()
         self.latest_rgb   = None   # 디버그 오버레이용
 
+        # exclusion_zones 누적 (오탐 필터링)
+        self._recent_detections: List[List[Dict]] = []   # 최근 N프레임 감지 결과
+        self._confirmed_zones:   List[Dict]        = []   # 확정된 금지 구역
+        self._last_exclusion_pub = None                   # 마지막 발행 시각
+
         # ---- QoS ----
         sensor_qos = QoSProfile(
             reliability=ReliabilityPolicy.BEST_EFFORT,
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
+        )
+        cmd_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=10,
         )
 
         # ---- Subscribe ----
@@ -143,9 +165,12 @@ class BBoxDetectionNode(Node):
         )
 
         # ---- Publish ----
-        self.bbox_pub   = self.create_publisher(Detection2DArray, '/vision/bboxes_2d',    10)
-        self.debug_pub  = self.create_publisher(Image,            '/vision/bbox_debug',   10)
-        self.error_pub  = self.create_publisher(Point,            '/vision/target_error', 10)
+        self.bbox_pub   = self.create_publisher(Detection2DArray, '/vision/bboxes_2d',       10)
+        self.debug_pub  = self.create_publisher(Image,            '/vision/bbox_debug',      10)
+        self.error_pub  = self.create_publisher(Point,            '/vision/target_error',    10)
+        # ★ master_node 경로계획용 금지 구역 발행
+        self.exclusion_pub = self.create_publisher(
+            String, '/vision/exclusion_zones', cmd_qos)
 
         self.get_logger().info(
             f'BBoxDetectionNode 시작\n'
@@ -237,6 +262,82 @@ class BBoxDetectionNode(Node):
             debug_msg = self.bridge.cv2_to_imgmsg(debug_img, encoding='bgr8')
             debug_msg.header = msg.header
             self.debug_pub.publish(debug_msg)
+
+        # ---- exclusion_zones 누적 + 주기적 발행 → master_node ----
+        self._accumulate_and_publish_exclusion_zones(all_bboxes)
+
+    # ==================== exclusion_zones (master_node용) ====================
+
+    def _accumulate_and_publish_exclusion_zones(self, bboxes: List[BBox2D]):
+        """
+        감지된 BBox에서 도색 불가 클래스만 추려 누적하고
+        EXCLUSION_PUB_INTERVAL 초마다 /vision/exclusion_zones 발행.
+
+        오탐 필터:
+          최근 EXCLUSION_CONFIRM_FRAMES 프레임 중
+          EXCLUSION_CONFIRM_COUNT 회 이상 감지된 클래스만 확정.
+
+        JSON 형식:
+          [{"class": "window", "cx": 0.3, "cy": -0.1, "w": 0.25, "h": 0.4}, ...]
+          cx, cy: 정규화 중심 오차 [-1, 1]
+          w, h:   정규화 BBox 크기 [0, 1]
+        """
+        # 현재 프레임 장애물만 추출
+        frame_obs: List[Dict] = [
+            {
+                'class': b.class_name,
+                'cx':    round(b.err_x_norm, 4),
+                'cy':    round(b.err_y_norm, 4),
+                'w':     round(b.w / self.img_w, 4),
+                'h':     round(b.h / self.img_h, 4),
+            }
+            for b in bboxes
+            if b.class_name in OBSTACLE_CLASSES
+        ]
+
+        # 최근 N프레임 누적 (슬라이딩 윈도우)
+        self._recent_detections.append(frame_obs)
+        if len(self._recent_detections) > EXCLUSION_CONFIRM_FRAMES:
+            self._recent_detections.pop(0)
+
+        # 클래스별 감지 횟수 집계
+        class_dets: Dict[str, List[Dict]] = {}
+        for frame in self._recent_detections:
+            for det in frame:
+                class_dets.setdefault(det['class'], []).append(det)
+
+        # CONFIRM_COUNT 이상 감지된 클래스만 확정 (평균 좌표 사용)
+        self._confirmed_zones = [
+            {
+                'class': cls,
+                'cx':    round(float(np.mean([d['cx'] for d in dets])), 4),
+                'cy':    round(float(np.mean([d['cy'] for d in dets])), 4),
+                'w':     round(float(np.mean([d['w']  for d in dets])), 4),
+                'h':     round(float(np.mean([d['h']  for d in dets])), 4),
+            }
+            for cls, dets in class_dets.items()
+            if len(dets) >= EXCLUSION_CONFIRM_COUNT
+        ]
+
+        # 주기적 발행
+        now = self.get_clock().now()
+        if (self._last_exclusion_pub is None or
+                (now - self._last_exclusion_pub).nanoseconds / 1e9
+                >= EXCLUSION_PUB_INTERVAL):
+            self._last_exclusion_pub = now
+            msg      = String()
+            msg.data = json.dumps(self._confirmed_zones, ensure_ascii=False)
+            self.exclusion_pub.publish(msg)
+
+            if self._confirmed_zones:
+                self.get_logger().info(
+                    f'📤 exclusion_zones {len(self._confirmed_zones)}개 발행\n' +
+                    '\n'.join(
+                        f'  [{z["class"]}] cx={z["cx"]:+.2f} cy={z["cy"]:+.2f} '
+                        f'w={z["w"]:.2f} h={z["h"]:.2f}'
+                        for z in self._confirmed_zones
+                    )
+                )
 
     # ==================== BBox 추출 ====================
 
